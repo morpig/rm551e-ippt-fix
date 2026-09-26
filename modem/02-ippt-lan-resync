@@ -1,0 +1,69 @@
+#!/bin/sh
+# 02-ippt-lan-resync — fix for Quectel RM551E-GL (SDX75, OpenWrt 23.05.4, R02A02)
+# IP passthrough (QMAP MPDN rule with IPPT). Installed to /etc/hotplug.d/iface/.
+#
+# The bug: /lib/netifd/rmnet.script → setup_lan_ippt (/etc/data/ippt.sh) installs the LAN side
+# of IPPT only if the bridge (e.g. br-lan2) already exists:
+#
+#     for i in $downstream; do network_get_device downdevice "$i"
+#         # "In case of bridge is not enumerated, downdevice will be NULL
+#         #  and control will not enter the below condition"
+#
+# After a modem restart or an eSIM switch the PDN (rmnet_dataN) often comes up before the VLAN
+# bridge is back. The WAN routes are installed; the LAN host route
+#     <PUBLIC_IP> dev <bridge> table custom_bind_<profile>        (lanUtils.sh
+#     util_setup_lan_route_rule_v4)
+# and the table-301 host route (ippt.sh ippt_add_dhcp_mark_pkts) are silently skipped, and
+# nothing re-runs them when the bridge appears. The device still gets its public IP over
+# DHCP, uplink works, but every downlink packet for it is routed back out rmnet_dataN
+# (`ip route get <ip> iif rmnet_dataN` → `cache <redirect>`): IMS registration gets no answer.
+#
+# The fix: on every interface up/update (the bridge coming up included), install the missing
+# LAN host routes for each profile with active IPPT, from QCMAP's own state:
+#   qcmap_lan.@profile[i].{profile_id,active_ippt,ippt_bridge_context}
+#   /var/state network.lan<ctx>.ifname              (the bridge device)
+#   /tmp/ipv4config<profile_id> PUBLIC_IP           (the device's public address)
+# Idempotent: only adds a route that is missing, only to QCMAP's own tables, and logs it.
+# Nothing of Quectel's is modified; removing this file removes the fix.
+
+case "$ACTION" in ifup|ifupdate) ;; *) exit 0 ;; esac
+
+ippt_lan_resync_note() {
+	echo "ippt-lan-resync: $*" > /dev/kmsg 2>/dev/null
+}
+
+ippt_lan_resync() {
+	local n i p active ctx sec dev PUBLIC_IP
+	n=$(uci -q get qcmap_lan.@no_of_configs[0].no_of_profiles)
+	i=0
+	while [ "$i" -le "${n:-3}" ]; do
+		p=$(uci -q get qcmap_lan.@profile[$i].profile_id)
+		active=$(uci -q get qcmap_lan.@profile[$i].active_ippt)
+		ctx=$(uci -q get qcmap_lan.@profile[$i].ippt_bridge_context)
+		i=$((i + 1))
+		[ -n "$p" ] && [ "$active" = 1 ] && [ -n "$ctx" ] || continue
+		[ "$ctx" = 0 ] && sec=lan || sec=lan$ctx
+		dev=$(uci -q -P /var/state get network.$sec.ifname)
+		[ -n "$dev" ] && [ -d "/sys/class/net/$dev" ] || continue
+		PUBLIC_IP=
+		[ -f "/tmp/ipv4config$p" ] && . "/tmp/ipv4config$p"
+		[ -n "$PUBLIC_IP" ] || continue
+		grep -q "custom_bind_$p" /etc/iproute2/rt_tables 2>/dev/null || continue
+
+		if ! ip route show table "custom_bind_$p" | grep -q "^$PUBLIC_IP dev $dev "; then
+			ip route replace "$PUBLIC_IP" dev "$dev" table "custom_bind_$p" &&
+				ippt_lan_resync_note "restored $PUBLIC_IP dev $dev table custom_bind_$p (profile $p)"
+		fi
+		if ! ip route show table 301 | grep -q "^$PUBLIC_IP dev $dev "; then
+			ip route replace "$PUBLIC_IP" dev "$dev" table 301 &&
+				ippt_lan_resync_note "restored $PUBLIC_IP dev $dev table 301 (profile $p)"
+		fi
+	done
+}
+
+# QCMAP's own setup for this event may still be running: let it finish first.
+if [ "${IPPT_LAN_RESYNC_NOW:-0}" = 1 ]; then
+	ippt_lan_resync
+else
+	( sleep 3; ippt_lan_resync ) >/dev/null 2>&1 &
+fi
