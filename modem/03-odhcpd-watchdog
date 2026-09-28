@@ -1,0 +1,100 @@
+#!/bin/sh
+# 03-odhcpd-watchdog — fix for Quectel RM551E-GL (SDX75, OpenWrt 23.05.4, R02A02): odhcpd
+# stuck in a busy loop after the modem's USB side re-enumerates, leaving the host with no
+# IPv6 on any LAN. Installed to /etc/hotplug.d/iface/ and /etc/hotplug.d/net/.
+#
+# The bug (seen 2026-09-28, after an eSIM profile switch): the modem re-enumerates
+# its USB functions (ecm0 and the bridges br-lan / br-lan2 are recreated; the OS doesn't
+# reboot). QCMAP restarts dnsmasq for each LAN, but odhcpd keeps running and ends up
+# spinning — a full CPU core, `ubus call dhcp …` → "Request timed out". odhcpd is what sends
+# router advertisements for lan and lan2 (dhcp.lan.ra / dhcp.lan2.ra = server), so the host
+# sees no router and gets no global IPv6 address: not on the internet interface, not on the
+# IMS VLAN. The PDNs, bridges and routes are all fine; `/etc/init.d/odhcpd restart` fixes it.
+#
+# The fix:
+# - ecm0 added (/etc/hotplug.d/net): a USB re-enumeration. The whole LAN side is recreated
+#   in order: ecm0, br-lan, br-lan2, ecm0.2. So wait for the bridges, then always restart
+#   odhcpd, and check it once more 30 s later. QCMAP's ordinary ecm0 down/up toggles don't
+#   recreate the device, so they don't trigger this.
+# - Any other LAN event (a lan* ifup/ifupdate, br-lan* added): check odhcpd after 10 s and
+#   again 30 s later. If it doesn't answer ubus twice in a row, restart it. If it isn't
+#   running although enabled, start it.
+# Nothing else is touched; removing the files removes the fix. Log lines go to the kernel
+# log ("odhcpd-watchdog: …", see dmesg).
+
+JOB=check
+case "$ACTION" in
+ifup|ifupdate)
+	case "$INTERFACE" in lan|lan[0-9]*) ;; *) exit 0 ;; esac ;;
+add)
+	# /etc/hotplug.d/net: INTERFACE is the device name.
+	case "$INTERFACE" in
+	ecm0) JOB=restart ;;
+	ecm*|br-lan*) ;;
+	*) exit 0 ;;
+	esac ;;
+*)
+	exit 0 ;;
+esac
+
+odhcpd_watchdog_note() {
+	echo "odhcpd-watchdog: $*" > /dev/kmsg 2>/dev/null
+}
+
+# True unless odhcpd's ubus object times out (the stuck state). Any answer counts as alive.
+odhcpd_answers() {
+	! ubus -t 3 call dhcp ipv6leases 2>&1 >/dev/null | grep -qi "timed out"
+}
+
+odhcpd_check() {
+	if ! pidof odhcpd >/dev/null; then
+		/etc/init.d/odhcpd enabled 2>/dev/null || return 0
+		odhcpd_watchdog_note "odhcpd not running: starting it"
+		/etc/init.d/odhcpd start
+		return 0
+	fi
+	odhcpd_answers && return 0
+	sleep 2
+	odhcpd_answers && return 0
+	odhcpd_watchdog_note "odhcpd (pid $(pidof odhcpd)) not answering ubus — stuck, no IPv6 RAs on the LAN: restarting"
+	/etc/init.d/odhcpd restart
+}
+
+# After a re-enumeration: odhcpd must come up with the new bridges, so wait for them.
+odhcpd_restart_after_reenumeration() {
+	local waited=0
+	while [ "$waited" -lt 30 ] && ! { [ -d /sys/class/net/br-lan ] && [ -d /sys/class/net/br-lan2 ]; }; do
+		sleep 1; waited=$((waited + 1))
+	done
+	sleep 3
+	if /etc/init.d/odhcpd enabled 2>/dev/null; then
+		odhcpd_watchdog_note "USB re-enumerated (ecm0 recreated): restarting odhcpd"
+		/etc/init.d/odhcpd restart
+	fi
+}
+
+if [ "${ODHCPD_WATCHDOG_NOW:-0}" = 1 ]; then
+	odhcpd_check
+	exit 0
+fi
+
+if [ "$JOB" = restart ]; then
+	# Its own lock: a check already running mustn't swallow the restart.
+	LOCK=/tmp/odhcpd-watchdog.restart.lock
+	mkdir "$LOCK" 2>/dev/null || exit 0
+	(
+		odhcpd_restart_after_reenumeration
+		sleep 30; odhcpd_check
+		rmdir "$LOCK"
+	) >/dev/null 2>&1 &
+	exit 0
+fi
+
+# One check at a time: a re-enumeration fires several events.
+LOCK=/tmp/odhcpd-watchdog.lock
+mkdir "$LOCK" 2>/dev/null || exit 0
+(
+	sleep 10; odhcpd_check
+	sleep 30; odhcpd_check
+	rmdir "$LOCK"
+) >/dev/null 2>&1 &

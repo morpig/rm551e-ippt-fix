@@ -1,29 +1,29 @@
 #!/bin/sh
-# install.sh — runs ON THE MODEM (Quectel RM551E-GL, OpenWrt/QCMAP). Installs the IPPT
-# LAN-resync hotplug hook (02-ippt-lan-resync); see that file for the bug and the fix.
+# install.sh — runs ON THE MODEM (Quectel RM551E-GL, OpenWrt/QCMAP). Installs the fix hooks:
+#   02-ippt-lan-resync   /etc/hotplug.d/iface/          IPPT LAN host routes (see the file)
+#   03-odhcpd-watchdog   /etc/hotplug.d/iface/ and net/ odhcpd stuck after USB re-enumeration
 #
-#   sh install.sh status      is the hook installed and current? are the IPPT host routes there?
-#   sh install.sh install     install / update the hook, then run it once now
-#   sh install.sh uninstall   remove the hook (routes it added stay until the next restart)
+#   sh install.sh status      are the hooks installed and current? IPPT routes? odhcpd healthy?
+#   sh install.sh install     install / update the hooks, then apply each once now
+#   sh install.sh uninstall   remove the hooks (routes already added stay until the next restart)
 #   sh install.sh dry-run     show what install would do
 #
 # Driven from the Mac by ../modem-ippt-fix.sh, which pushes this folder to /tmp and
 # re-applies it after a firmware upgrade (a firmware image can replace /etc).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
-HOOK_NAME=02-ippt-lan-resync
-SRC="$HERE/$HOOK_NAME"
-DST="/etc/hotplug.d/iface/$HOOK_NAME"
 MODE=${1:-status}
+# hook:hotplug-subsystem pairs; a hook may go into several subsystems.
+HOOKS="02-ippt-lan-resync:iface 03-odhcpd-watchdog:iface 03-odhcpd-watchdog:net"
 
 say() { printf '%s\n' "$*"; }
 md5() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
 
-# Platform check: QCMAP with IPPT support, not a specific firmware string (the hook only reads
-# QCMAP state and adds missing routes, so it's safe on any build with these pieces).
+# Platform check: QCMAP with IPPT support, not a specific firmware string (the hooks only read
+# QCMAP state, add missing routes and restart odhcpd, so they're safe on any build with these).
 platform() {
 	[ -f /etc/data/ippt.sh ] && [ -f /etc/data/lanUtils.sh ] && [ -d /etc/hotplug.d/iface ] &&
-		uci -q get qcmap_lan.@no_of_configs[0].no_of_profiles >/dev/null
+		[ -d /etc/hotplug.d/net ] && uci -q get qcmap_lan.@no_of_configs[0].no_of_profiles >/dev/null
 }
 
 routes_report() {
@@ -47,35 +47,61 @@ routes_report() {
 	done
 }
 
-say "== RM551E IPPT LAN-resync fix: $MODE"
-platform || { say "  not a QCMAP/IPPT modem (missing /etc/data/ippt.sh, lanUtils.sh or qcmap_lan) — nothing done"; exit 1; }
-[ -f "$SRC" ] || { say "  $SRC missing from this bundle"; exit 1; }
+odhcpd_report() {
+	local pid out
+	pid=$(pidof odhcpd)
+	if [ -z "$pid" ]; then say "  odhcpd: NOT running (no IPv6 RAs on the LAN)"; return; fi
+	out=$(ubus -t 3 call dhcp ipv6leases 2>&1 >/dev/null)
+	case "$out" in
+	*"timed out"*) say "  odhcpd: pid $pid, NOT answering ubus — stuck (no IPv6 RAs on the LAN)" ;;
+	*) say "  odhcpd: pid $pid, answering" ;;
+	esac
+}
+
+report() {
+	routes_report
+	odhcpd_report
+}
+
+say "== RM551E fix hooks: $MODE"
+platform || { say "  not a QCMAP/IPPT modem (missing ippt.sh, lanUtils.sh, hotplug dirs or qcmap_lan) — nothing done"; exit 1; }
+
+for pair in $HOOKS; do
+	[ -f "$HERE/${pair%%:*}" ] || { say "  $HERE/${pair%%:*} missing from this bundle"; exit 1; }
+done
 
 case "$MODE" in
-status)
-	if [ -f "$DST" ]; then
-		[ "$(md5 "$DST")" = "$(md5 "$SRC")" ] && say "  hook: installed, current" || say "  hook: installed, DIFFERENT from this bundle (run install)"
-	else
-		say "  hook: NOT installed (a firmware upgrade removes it: run install)"
-	fi
-	routes_report
-	;;
-dry-run)
-	if [ -f "$DST" ] && [ "$(md5 "$DST")" = "$(md5 "$SRC")" ]; then say "  would do nothing (already current)"
-	else say "  would copy $HOOK_NAME to $DST (mode 755) and run it once"; fi
-	routes_report
+status|dry-run)
+	for pair in $HOOKS; do
+		name=${pair%%:*}; dst=/etc/hotplug.d/${pair##*:}/$name
+		if [ -f "$dst" ] && [ "$(md5 "$dst")" = "$(md5 "$HERE/$name")" ]; then
+			say "  $dst: installed, current"
+		elif [ -f "$dst" ]; then
+			say "  $dst: installed, DIFFERENT from this bundle$([ "$MODE" = dry-run ] && echo " — would update" || echo " (run install)")"
+		else
+			say "  $dst: NOT installed$([ "$MODE" = dry-run ] && echo " — would install" || echo " (a firmware upgrade removes it: run install)")"
+		fi
+	done
+	report
 	;;
 install)
-	cp "$SRC" "$DST.tmp" && chmod 755 "$DST.tmp" && mv "$DST.tmp" "$DST" || { say "  copy failed"; exit 1; }
-	[ "$(md5 "$DST")" = "$(md5 "$SRC")" ] || { say "  verify failed"; exit 1; }
-	say "  hook: installed at $DST"
+	for pair in $HOOKS; do
+		name=${pair%%:*}; dst=/etc/hotplug.d/${pair##*:}/$name
+		cp "$HERE/$name" "$dst.tmp" && chmod 755 "$dst.tmp" && mv "$dst.tmp" "$dst" || { say "  copy to $dst failed"; exit 1; }
+		[ "$(md5 "$dst")" = "$(md5 "$HERE/$name")" ] || { say "  verify of $dst failed"; exit 1; }
+		say "  installed $dst"
+	done
 	# Apply now, for the state the modem is in already.
-	ACTION=ifupdate IPPT_LAN_RESYNC_NOW=1 sh "$DST"
-	routes_report
+	ACTION=ifupdate IPPT_LAN_RESYNC_NOW=1 sh /etc/hotplug.d/iface/02-ippt-lan-resync
+	ACTION=ifupdate INTERFACE=lan ODHCPD_WATCHDOG_NOW=1 sh /etc/hotplug.d/iface/03-odhcpd-watchdog
+	report
 	;;
 uninstall)
-	rm -f "$DST" && say "  hook: removed"
-	routes_report
+	for pair in $HOOKS; do
+		dst=/etc/hotplug.d/${pair##*:}/${pair%%:*}
+		rm -f "$dst" && say "  removed $dst"
+	done
+	report
 	;;
 *)
 	say "  usage: sh install.sh [status|install|uninstall|dry-run]"; exit 2

@@ -1,9 +1,10 @@
 #!/bin/sh
-# modem-ippt-fix.sh — install / check the RM551E IPPT LAN-resync fix on the modem, from the Mac.
-# The fix itself is modem/ (see 02-ippt-lan-resync for the bug). Re-run
+# modem-ippt-fix.sh — install / check the RM551E fix hooks on the modem, from the Mac:
+# 02-ippt-lan-resync (IPPT host routes) and 03-odhcpd-watchdog (odhcpd stuck after USB
+# re-enumeration). The fixes themselves are in modem/ (each file explains its bug). Re-run
 # `install` after every modem firmware upgrade: a firmware image can replace /etc.
 #
-#   ./modem-ippt-fix.sh status      (default) hook installed? IPPT host routes present?
+#   ./modem-ippt-fix.sh status      (default) hooks installed? IPPT host routes? odhcpd healthy?
 #   ./modem-ippt-fix.sh install     install / update, apply once now
 #   ./modem-ippt-fix.sh uninstall
 #   ./modem-ippt-fix.sh dry-run
@@ -26,5 +27,5 @@ SERIAL=${ADB_SERIAL:-$(adb devices | awk 'NR > 1 && $2 == "device" { print $1; e
 [ -n "$SERIAL" ] || { echo "no ADB device (modem ADB enabled? another app holding the USB device?)" >&2; exit 1; }
 
 adb -s "$SERIAL" shell "rm -rf $REMOTE && mkdir -p $REMOTE" >/dev/null
-adb -s "$SERIAL" push "$BUNDLE/install.sh" "$BUNDLE/02-ippt-lan-resync" "$REMOTE/" >/dev/null 2>&1
+adb -s "$SERIAL" push "$BUNDLE"/install.sh "$BUNDLE"/0[0-9]-* "$REMOTE/" >/dev/null 2>&1
 adb -s "$SERIAL" shell "sh $REMOTE/install.sh $MODE"
