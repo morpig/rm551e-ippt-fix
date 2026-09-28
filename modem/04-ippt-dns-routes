@@ -1,0 +1,145 @@
+#!/bin/sh
+# 04-ippt-dns-routes — fix for Quectel RM551E-GL (SDX75, OpenWrt 23.05.4, R02A02): the
+# modem's own DNS breaks when a passthrough (IPPT) connection is given the same IPv4 DNS
+# servers as the internet connection. Installed to /etc/hotplug.d/iface/.
+#
+# The bug: for every connection that comes up, /lib/netifd/rmnet.script calls
+# util_add_dnsv4 (/etc/data/lanUtils.sh), which asks netifd for a /32 host route to each of
+# that connection's DNS servers via its rmnet device:
+#
+#     proto_add_ipv4_route "$dns" 32 "" ""
+#
+# netifd puts an interface's routes in that interface's table: main, unless the interface
+# has an ip4table. QCMAP gives a passthrough connection its own table (custom_bind_<profile>)
+# and sets it as ip6table for the IPv6 side, but never as ip4table. So the IPv4 DNS routes of
+# the passthrough connection land in main. When it has the same DNS servers as the internet
+# connection, and comes up after it, its routes replace the internet connection's:
+#
+#     10.x.x.x dev rmnet_data2 proto static scope link      (the passthrough connection)
+#
+# With passthrough the modem has only a placeholder address on that connection (169.254.x;
+# the real one belongs to the host), so every DNS query the modem sends goes out with a
+# source the network doesn't know and gets no answer. dnsmasq has no working upstream, and
+# DNS from the LAN to the modem times out. Internet by IP still works.
+#
+# The fix, the same layout QCMAP already uses for IPv6: after a connection comes up, for
+# each profile with active IPPT, every main-table host route to one of that connection's DNS
+# servers via its rmnet is
+#   - kept for the passthrough connection in custom_bind_<profile>, and
+#   - re-pointed in main at the non-passthrough connection that lists the same server (its
+#     own netifd route, which the passthrough connection's replaced), or, when no other
+#     connection lists it, removed from main (the default route then carries the queries).
+# Idempotent; one run at a time (a lock in /tmp); only touches routes that point into a
+# passthrough connection's rmnet; logs every change to the kernel log ("ippt-dns-routes: …"). Nothing of Quectel's is modified;
+# removing the file removes the fix.
+
+case "$ACTION" in ifup|ifupdate) ;; *) exit 0 ;; esac
+
+ippt_dns_note() {
+	echo "ippt-dns-routes: $*" > /dev/kmsg 2>/dev/null
+}
+
+# "<interface>:<l3 device>" for every netifd interface that has one.
+ippt_dns_interfaces() {
+	local i dev
+	for i in $(ubus list 'network.interface.*' 2>/dev/null | cut -d. -f3); do
+		dev=$(ubus call "network.interface.$i" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
+		[ -n "$dev" ] && echo "$i:$dev"
+	done
+}
+
+# IPv4 DNS servers netifd holds for interface $1.
+ippt_dns_list() {
+	ubus call "network.interface.$1" status 2>/dev/null | jsonfilter -e '@["dns-server"][*]' 2>/dev/null | grep -v ':'
+}
+
+# IPv4 DNS servers of the interfaces on device $1.
+ippt_dns_servers_of_dev() {
+	local pair
+	for pair in $(ippt_dns_interfaces); do
+		[ "${pair##*:}" = "$1" ] && ippt_dns_list "${pair%%:*}"
+	done | sort -u
+}
+
+# A device other than the passthrough ones ($2…) whose netifd interface lists DNS server $1.
+ippt_dns_owner() {
+	local dns="$1" pair dev
+	shift
+	for pair in $(ippt_dns_interfaces); do
+		dev=${pair##*:}
+		case " $* " in *" $dev "*) continue ;; esac
+		ippt_dns_list "${pair%%:*}" | grep -qx "$dns" && { echo "$dev"; return 0; }
+	done
+	return 1
+}
+
+ippt_dns_fix() {
+	local n i p active rmnet ippt_devs dns owner
+	n=$(uci -q get qcmap_lan.@no_of_configs[0].no_of_profiles)
+
+	# The passthrough connections' devices, from QCMAP's own rules
+	# ("from all iif rmnet_dataN lookup custom_bind_<profile>").
+	ippt_devs=
+	i=0
+	while [ "$i" -le "${n:-3}" ]; do
+		p=$(uci -q get qcmap_lan.@profile[$i].profile_id)
+		active=$(uci -q get qcmap_lan.@profile[$i].active_ippt)
+		i=$((i + 1))
+		[ -n "$p" ] && [ "$active" = 1 ] || continue
+		rmnet=$(ip rule | sed -n "s/.*from all iif \(rmnet_data[0-9]*\) lookup custom_bind_$p\$/\1/p" | head -1)
+		[ -n "$rmnet" ] && ippt_devs="$ippt_devs $rmnet:$p"
+	done
+
+	for entry in $ippt_devs; do
+		rmnet=${entry%%:*}
+		p=${entry##*:}
+		grep -q "custom_bind_$p" /etc/iproute2/rt_tables 2>/dev/null || continue
+		for dns in $(ippt_dns_servers_of_dev "$rmnet"); do
+			ip route show table main | grep -q "^$dns dev $rmnet " || continue
+			# The passthrough connection keeps its own route, in its own table.
+			ip route replace "$dns" dev "$rmnet" table "custom_bind_$p" proto static scope link
+			owner=$(ippt_dns_owner "$dns" $(for e in $ippt_devs; do echo "${e%%:*}"; done))
+			if [ -n "$owner" ]; then
+				ip route replace "$dns" dev "$owner" proto static scope link &&
+					ippt_dns_note "re-pointed $dns: main $rmnet → $owner (passthrough copy in custom_bind_$p)"
+			else
+				ip route del "$dns" dev "$rmnet" table main &&
+					ippt_dns_note "moved $dns dev $rmnet from main to custom_bind_$p (no other connection lists it)"
+			fi
+		done
+	done
+}
+
+# One run at a time: a connection coming up fires several events at once, and two runs
+# fixing the same route race each other. A run that finds the lock taken leaves a note and
+# exits; the running one repeats while notes arrive, so a route QCMAP re-adds after a
+# check is still caught. A lock older than 60 s is from a run that died: taken over.
+IPPT_DNS_LOCK=/tmp/ippt-dns-routes.lock
+IPPT_DNS_AGAIN=/tmp/ippt-dns-routes.again
+
+ippt_dns_locked_fix() {
+	local age
+	if ! mkdir "$IPPT_DNS_LOCK" 2>/dev/null; then
+		age=$(( $(date +%s) - $(date -r "$IPPT_DNS_LOCK" +%s 2>/dev/null || date +%s) ))
+		if [ "$age" -le 60 ] || ! rmdir "$IPPT_DNS_LOCK" 2>/dev/null || ! mkdir "$IPPT_DNS_LOCK" 2>/dev/null; then
+			touch "$IPPT_DNS_AGAIN"
+			return 0
+		fi
+	fi
+	while :; do
+		rm -f "$IPPT_DNS_AGAIN"
+		ippt_dns_fix
+		[ -e "$IPPT_DNS_AGAIN" ] || break
+	done
+	rmdir "$IPPT_DNS_LOCK"
+	# A note left between the last check and the unlock.
+	[ -e "$IPPT_DNS_AGAIN" ] && ippt_dns_locked_fix
+	return 0
+}
+
+# QCMAP's own setup for this event (util_add_dnsv4) may still be running: let it finish.
+if [ "${IPPT_DNS_ROUTES_NOW:-0}" = 1 ]; then
+	ippt_dns_locked_fix
+else
+	( sleep 3; ippt_dns_locked_fix ) >/dev/null 2>&1 &
+fi

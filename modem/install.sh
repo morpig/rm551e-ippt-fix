@@ -2,6 +2,7 @@
 # install.sh — runs ON THE MODEM (Quectel RM551E-GL, OpenWrt/QCMAP). Installs the fix hooks:
 #   02-ippt-lan-resync   /etc/hotplug.d/iface/          IPPT LAN host routes (see the file)
 #   03-odhcpd-watchdog   /etc/hotplug.d/iface/ and net/ odhcpd stuck after USB re-enumeration
+#   04-ippt-dns-routes   /etc/hotplug.d/iface/          DNS routes hijacked by a passthrough PDN
 #
 #   sh install.sh status      are the hooks installed and current? IPPT routes? odhcpd healthy?
 #   sh install.sh install     install / update the hooks, then apply each once now
@@ -14,7 +15,7 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 MODE=${1:-status}
 # hook:hotplug-subsystem pairs; a hook may go into several subsystems.
-HOOKS="02-ippt-lan-resync:iface 03-odhcpd-watchdog:iface 03-odhcpd-watchdog:net"
+HOOKS="02-ippt-lan-resync:iface 03-odhcpd-watchdog:iface 03-odhcpd-watchdog:net 04-ippt-dns-routes:iface"
 
 say() { printf '%s\n' "$*"; }
 md5() { md5sum "$1" 2>/dev/null | cut -d' ' -f1; }
@@ -58,9 +59,30 @@ odhcpd_report() {
 	esac
 }
 
+# For each passthrough connection: where main sends its IPv4 DNS servers. Into the
+# passthrough connection itself is the broken state (the modem has no real address there).
+dns_report() {
+	local line rmnet p i dns via
+	ip rule | sed -n 's/.*from all iif \(rmnet_data[0-9]*\) lookup custom_bind_\([0-9]*\)$/\1 \2/p' | sort -u |
+	while read -r rmnet p; do
+		for i in $(ubus list 'network.interface.*' 2>/dev/null | cut -d. -f3); do
+			[ "$(ubus call "network.interface.$i" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)" = "$rmnet" ] || continue
+			for dns in $(ubus call "network.interface.$i" status | jsonfilter -e '@["dns-server"][*]' 2>/dev/null | grep -v ':'); do
+				via=$(ip route get "$dns" 2>/dev/null | sed -n 's/.* dev \([^ ]*\).*/\1/p' | head -1)
+				if [ "$via" = "$rmnet" ]; then
+					say "  DNS $dns (profile $p): main routes it into the passthrough connection $rmnet — BROKEN (run install)"
+				else
+					say "  DNS $dns (profile $p): via ${via:-?}, ok"
+				fi
+			done
+		done
+	done
+}
+
 report() {
 	routes_report
 	odhcpd_report
+	dns_report
 }
 
 say "== RM551E fix hooks: $MODE"
@@ -94,6 +116,7 @@ install)
 	# Apply now, for the state the modem is in already.
 	ACTION=ifupdate IPPT_LAN_RESYNC_NOW=1 sh /etc/hotplug.d/iface/02-ippt-lan-resync
 	ACTION=ifupdate INTERFACE=lan ODHCPD_WATCHDOG_NOW=1 sh /etc/hotplug.d/iface/03-odhcpd-watchdog
+	ACTION=ifupdate IPPT_DNS_ROUTES_NOW=1 sh /etc/hotplug.d/iface/04-ippt-dns-routes
 	report
 	;;
 uninstall)

@@ -1,7 +1,7 @@
 #!/bin/sh
 # modem-ippt-fix.sh — install / check the RM551E fix hooks on the modem, from the Mac:
-# 02-ippt-lan-resync (IPPT host routes) and 03-odhcpd-watchdog (odhcpd stuck after USB
-# re-enumeration). The fixes themselves are in modem/ (each file explains its bug). Re-run
+# 02-ippt-lan-resync (IPPT host routes), 03-odhcpd-watchdog (odhcpd stuck after USB
+# re-enumeration) and 04-ippt-dns-routes (DNS routes hijacked by a passthrough PDN). The fixes themselves are in modem/ (each file explains its bug). Re-run
 # `install` after every modem firmware upgrade: a firmware image can replace /etc.
 #
 #   ./modem-ippt-fix.sh status      (default) hooks installed? IPPT host routes? odhcpd healthy?
